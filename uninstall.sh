@@ -16,3 +16,15 @@ say "removed $BIN/wallrotate"
 rm -f "$STATE"
 rm -rf "$CACHE"
 say "removed rotation history and cache (config kept)"
+
+# hints: nothing below is removed automatically
+echo
+say "the current wallpaper stays on screen: awww/mpvpaper keep showing it. To clear it:"
+echo "   awww kill; pkill -x mpvpaper"
+say "dependencies were left installed (other programs may use them). If unused, remove with:"
+if grep -qsE '^ID(_LIKE)?=.*arch' /etc/os-release; then
+  echo "   sudo pacman -Rns awww mpvpaper ffmpeg"
+else
+  echo "   your package manager: awww, mpvpaper, ffmpeg"
+fi
+say "also remove the wallrotate line from your autostart, and ~/.config/wallrotate if unwanted"

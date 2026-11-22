@@ -59,6 +59,14 @@ curl -fsSL https://raw.githubusercontent.com/darkogoluza/wallrotate/main/uninsta
 
 Stops it and removes the program, its rotation history and cache. Your config is kept.
 
+Not removed automatically:
+
+- **The current wallpaper stays on screen**, because `awww`/`mpvpaper` keep showing the last
+  one. Clear it with `awww kill; pkill -x mpvpaper`, or let your next wallpaper tool replace it.
+- **Dependencies** (`awww`, `mpvpaper`, `ffmpeg`), since other programs may use them. If
+  unused, remove them with your package manager, e.g. `sudo pacman -Rns awww mpvpaper ffmpeg`.
+- **Your autostart line** and `~/.config/wallrotate`, if you don't want them anymore.
+
 ## Configure
 
 Create `~/.config/wallrotate/config.json`. Changes apply within a minute, no restart needed.
