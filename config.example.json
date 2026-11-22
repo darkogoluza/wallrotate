@@ -1,0 +1,21 @@
+{
+  "dir": "~/Pictures/Wallpapers",
+  "image_mode": "fill",
+  "video_options": "no-audio loop --hwdec=auto",
+  "transition": "fade",
+  "transition_duration": 1,
+  "transition_fps": 60,
+  "natural_blend": true,
+  "sync_lock_screen": true,
+  "wallpapers": [
+    {
+      "name": "Day and night example",
+      "variants": [
+        { "from": "07:00", "file": "my-day-image.jpg" },
+        { "from": "19:00", "file": "my-night-image.jpg" }
+      ]
+    },
+    { "file": "single-image.png" },
+    { "file": "~/Videos/live-wallpaper.mp4" }
+  ]
+}

@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""Daily wallpaper rotator: images via awww, videos via mpvpaper.
+
+Config: ~/.config/wallrotate/config.json (re-read every minute)
+  wallpapers: list of entries, each either
+    {"file": "x.jpg"}                                                   same all day
+    {"name": "..", "variants": [{"from": "HH:MM", "file": ".."}, ...]}  changes by time of day
+  One entry per day, changing at midnight. Shuffle bag: every entry is shown once (random
+  order) before any repeats; a group counts as one entry. State in ~/.local/state/wallrotate.json
+  survives reboots; days powered off count as a single change.
+
+Settings (top level, per entry, or per variant):
+  transition           awww effect: fade, wipe, grow, ... (default fade)
+  transition_duration  seconds (default 1)
+  transition_fps       default 60
+  natural_blend        fades only, default true: the fade is pre-rendered as a video mixed in
+                       linear light (no muddy middle) and played by mpvpaper at exact fps
+Top level only: dir, image_mode (fill|fit), video_options,
+  sync_lock_screen (default true: if DankMaterialShell is installed, its lock screen shows
+  the current wallpaper).
+
+Usage:
+  wallrotate                         run the daemon
+  wallrotate next                    pick a different entry for today
+  wallrotate status                  show today's entry
+  wallrotate preview NAME [hold_s]   play a group's variants in order, then back to today's
+  wallrotate show FILE [hold_s]      transition to one file, then back to today's
+"""
+import json, os, random, shutil, signal, subprocess, sys, tempfile, time
+from datetime import date, datetime
+
+CONFIG = os.path.expanduser("~/.config/wallrotate/config.json")
+STATE = os.path.expanduser("~/.local/state/wallrotate.json")
+VIDEO_EXT = (".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v")
+NICE = ["nice", "-n", "19"]  # rendering a fade bursts all cores for a few seconds
+PLAYER_STARTUP_S = 1.5  # mpvpaper takes ~1s to show its first frame (measured)
+QUIET = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+FRAME_CACHE = os.path.expanduser("~/.cache/wallrotate")  # still frames of videos for the lock screen
+
+
+# ---------- config & daily pick ----------
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def entry_key(e):
+    return e.get("name") or e.get("file") or json.dumps(e, sort_keys=True)
+
+
+def minutes(hhmm):
+    h, m = hhmm.split(":")
+    return int(h) * 60 + int(m)
+
+
+def choice_for_time(entry, now_min):
+    """The entry, or for a group the variant whose 'from' is the latest <= now (before the
+    first one: last night's). Variant settings override the entry's."""
+    variants = entry.get("variants")
+    if not variants:
+        return entry
+    vs = sorted(variants, key=lambda v: minutes(v["from"]))
+    current = vs[-1]
+    for v in vs:
+        if minutes(v["from"]) <= now_min:
+            current = v
+    return {**{k: v for k, v in entry.items() if k != "variants"}, **current}
+
+
+def pick_entry(entries, state, today, force_new=False):
+    """Shuffle bag: every entry is shown once per round before any repeats.
+    Same day -> keep today's pick. Any later day (even after days powered off) -> one new pick.
+    state: {"date", "key" (today's entry), "shown" (keys used this round)}."""
+    keys = [entry_key(e) for e in entries]
+    if not force_new and state.get("date") == today and state.get("key") in keys:
+        # state from before the shuffle bag has no "shown": count today's entry as shown
+        return entries[keys.index(state["key"])], {**state, "shown": state.get("shown") or [state["key"]]}
+    shown = [k for k in state.get("shown", []) if k in keys]  # forget entries removed from config
+    pool = [e for e in entries if entry_key(e) not in shown]
+    if not pool:  # round complete: start a new one, but don't repeat the one just shown
+        shown = []
+        pool = [e for e in entries if entry_key(e) != state.get("key")] or entries
+    chosen = random.choice(pool)
+    return chosen, {"date": today, "key": entry_key(chosen), "shown": shown + [entry_key(chosen)]}
+
+
+def settings(cfg, choice=None):
+    """Top-level settings, overridden by the chosen entry/variant's transition settings."""
+    s = {k: v for k, v in cfg.items() if k != "wallpapers"}
+    s.update({k: v for k, v in (choice or {}).items()
+              if k.startswith("transition") or k == "natural_blend"})
+    return s
+
+
+def resolve(path, base):
+    path = os.path.expanduser(path)
+    return path if os.path.isabs(path) else os.path.join(os.path.expanduser(base), path)
+
+
+# ---------- display ----------
+
+def detach(cmd):
+    # setsid -f: not our child, so killing it later leaves no zombie
+    subprocess.run(["setsid", "-f", *cmd], **QUIET)
+
+
+def video_playing(path):
+    out = subprocess.run(["pgrep", "-af", "mpvpaper"], capture_output=True, text=True).stdout
+    return any(path in line for line in out.splitlines())
+
+
+def awww_state():
+    """("WxH" of the first output, path currently shown) from `awww query`."""
+    out = subprocess.run(["awww", "query"], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        size = next((p.strip() for p in line.split(",")[0].split(":") if "x" in p.strip()), None)
+        shown = line.split("image: ", 1)[1].strip() if "image: " in line else None
+        return size, shown
+    return None, None
+
+
+def awww_img(path, s, kind, duration):
+    subprocess.run(["awww", "img", path,
+                    "--resize", "crop" if s.get("image_mode", "fill") == "fill" else "fit",
+                    "--transition-type", kind,
+                    "--transition-duration", str(duration),
+                    "--transition-fps", str(s.get("transition_fps", 60))], **QUIET)
+
+
+def last_frame_t(duration, fps):
+    """Timestamp of the last video frame (frames sit at 0, 1/fps, ...)."""
+    return round((round(duration * fps) - 1) / fps, 6)
+
+
+def render_fade_video(src, dst, size, duration, fps, out):
+    """One ffmpeg pass: both images cropped to the screen, mixed in linear light per frame.
+    The blend reaches 100% on the last frame, so the hand-off to awww is invisible."""
+    w, h = size.split("x")
+    fit = (f"scale={w}:{h}:force_original_aspect_ratio=increase:flags=lanczos,crop={w}:{h},"
+           "format=gbrpf32le,zscale=tin=iec61966-2-1:t=linear")
+    blend = f"blend=all_expr='A+(B-A)*clip(T/{last_frame_t(duration, fps)}\\,0\\,1)'"
+    subprocess.run([*NICE, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                    "-loop", "1", "-framerate", str(fps), "-t", str(duration), "-i", src,
+                    "-loop", "1", "-framerate", str(fps), "-t", str(duration), "-i", dst,
+                    "-filter_complex",
+                    f"[0]{fit}[a];[1]{fit}[b];[a][b]{blend},zscale=tin=linear:t=iec61966-2-1,format=gbrp[v]",
+                    "-map", "[v]", "-frames:v", str(round(duration * fps)),
+                    "-c:v", "libx264rgb", "-preset", "ultrafast", "-crf", "8", out], check=True)
+
+
+def natural_fade(src, dst, size, s):
+    """Play a pre-rendered linear-light fade with mpvpaper, then leave dst in awww underneath.
+    (awww's own fade mixes raw sRGB values, which looks muddy halfway; chaining awww fades
+    through in-between images stutters because awww doesn't keep short durations.)"""
+    duration = float(s.get("transition_duration", 1))
+    tmp = tempfile.mkdtemp(prefix="wallrotate-", dir=os.environ.get("XDG_RUNTIME_DIR"))
+    try:
+        video = os.path.join(tmp, "fade.mkv")
+        render_fade_video(src, dst, size, duration, int(s.get("transition_fps", 60)), video)
+        subprocess.run(["pkill", "-x", "mpvpaper"])
+        detach(["mpvpaper", "-o", "no-audio --loop-file=no --keep-open=yes --hwdec=no", "*", video])
+        # closing late is harmless (the last frame is dst); closing early would cut the fade
+        time.sleep(PLAYER_STARTUP_S + duration)
+        awww_img(dst, s, "none", 0)
+        time.sleep(0.4)  # let awww finish drawing before the player goes away
+    except (OSError, subprocess.CalledProcessError) as e:
+        print(f"wallrotate: natural fade failed ({e}), plain fade instead", file=sys.stderr)
+        awww_img(dst, s, "fade", duration)
+    finally:
+        subprocess.run(["pkill", "-x", "mpvpaper"])
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def apply(path, s):
+    if path.lower().endswith(VIDEO_EXT):
+        if not video_playing(path):
+            subprocess.run(["pkill", "-x", "mpvpaper"])
+            detach(["mpvpaper", "-o", s.get("video_options", "no-audio loop"), "*", path])
+            time.sleep(1)  # let the video appear before removing the image underneath
+        subprocess.run(["pkill", "-x", "swaybg"])
+        subprocess.run(["awww", "kill"], **QUIET)
+        return
+    if subprocess.run(["pgrep", "-x", "awww-daemon"], capture_output=True).returncode != 0:
+        detach(["awww-daemon"])
+        time.sleep(1)
+    size, current = awww_state()
+    if current != path:
+        kind = s.get("transition", "fade")
+        if kind == "fade" and s.get("natural_blend", True) and size and current and os.path.exists(current):
+            natural_fade(current, path, size, s)
+        else:
+            awww_img(path, s, kind, s.get("transition_duration", 1))
+            time.sleep(0.3)
+    subprocess.run(["pkill", "-x", "swaybg"])  # Omarchy starts one at login / on theme change
+    subprocess.run(["pkill", "-x", "mpvpaper"])
+
+
+def sync_lock_screen(path):
+    """Show the current wallpaper on the DMS lock screen too (a still frame on video days)."""
+    image = path
+    if path.lower().endswith(VIDEO_EXT):
+        image = os.path.join(FRAME_CACHE, os.path.splitext(os.path.basename(path))[0] + ".jpg")
+        if not os.path.exists(image):
+            os.makedirs(FRAME_CACHE, exist_ok=True)
+            subprocess.run([*NICE, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", "1",
+                            "-i", path, "-frames:v", "1", "-q:v", "2", image], **QUIET)
+            if not os.path.exists(image):
+                return
+    current = subprocess.run(["dms", "ipc", "call", "settings", "get", "lockScreenWallpaperPath"],
+                             capture_output=True, text=True).stdout.strip().strip('"')
+    if current != image:
+        subprocess.run(["dms", "ipc", "call", "settings", "set", "lockScreenWallpaperPath", image], **QUIET)
+
+
+def tick(force_new=False):
+    cfg = load_json(CONFIG, None)
+    if not cfg or not cfg.get("wallpapers"):
+        print(f"wallrotate: no wallpapers in {CONFIG}", file=sys.stderr)
+        return None
+    base = cfg.get("dir", "~")
+    # skip entries whose files were deleted, so a missing file never leaves a day stuck
+    entries = [e for e in cfg["wallpapers"]
+               if all(os.path.exists(resolve(v["file"], base)) for v in e.get("variants") or [e])]
+    if not entries:
+        print("wallrotate: none of the configured files exist", file=sys.stderr)
+        return None
+    state = load_json(STATE, {})
+    entry, new_state = pick_entry(entries, state, date.today().isoformat(), force_new)
+    if new_state != state:
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
+        with open(STATE, "w") as f:
+            json.dump(new_state, f)
+    now = datetime.now()
+    choice = choice_for_time(entry, now.hour * 60 + now.minute)
+    path = resolve(choice["file"], base)
+    apply(path, settings(cfg, choice))
+    if cfg.get("sync_lock_screen", True) and shutil.which("dms"):  # DankMaterialShell only
+        sync_lock_screen(path)
+    return path
+
+
+# ---------- manual commands ----------
+
+def with_daemon_paused(fn):
+    """Pause the background rotator so it doesn't switch back mid-way; always resume it."""
+    out = subprocess.run(["pgrep", "-f", r"python3? .*wallrotate$"], capture_output=True, text=True).stdout
+    pids = [int(p) for p in out.split() if int(p) != os.getpid()]
+    for p in pids:
+        os.kill(p, signal.SIGSTOP)
+    try:
+        fn()
+    except KeyboardInterrupt:
+        print("\nstopped")
+    finally:
+        for p in pids:
+            os.kill(p, signal.SIGCONT)
+        print("back to today's wallpaper:", tick())
+
+
+def preview(name, hold):
+    cfg = load_json(CONFIG, {})
+    entries = cfg.get("wallpapers", [])
+    entry = next((e for e in entries if entry_key(e).lower() == name.lower()), None)
+    if not entry:
+        sys.exit(f"no entry named {name!r}; names: " + ", ".join(entry_key(e) for e in entries))
+    variants = sorted(entry.get("variants") or [entry], key=lambda v: minutes(v.get("from", "00:00")))
+
+    def run():
+        for v in variants:
+            choice = {**{k: x for k, x in entry.items() if k != "variants"}, **v}
+            print(f"→ {v.get('from', '')} {choice['file']}")
+            apply(resolve(choice["file"], cfg.get("dir", "~")), settings(cfg, choice))
+            time.sleep(hold)
+    with_daemon_paused(run)
+
+
+def show(path, hold):
+    cfg = load_json(CONFIG, {})
+
+    def run():
+        apply(resolve(path, cfg.get("dir", "~")), settings(cfg))
+        time.sleep(hold)
+    with_daemon_paused(run)
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    cmd = args[0] if args else ""
+    if cmd == "next":
+        print(tick(force_new=True))
+    elif cmd == "status":
+        st = load_json(STATE, {})
+        total = len(load_json(CONFIG, {}).get("wallpapers", []))
+        print(f"today: {st.get('key')} ({st.get('date')})")
+        print(f"round: {len(st.get('shown', []))}/{total} shown, then a new shuffled round starts")
+    elif cmd == "preview" and len(args) > 1:
+        preview(args[1], float(args[2]) if len(args) > 2 else 5)
+    elif cmd == "show" and len(args) > 1:
+        show(args[1], float(args[2]) if len(args) > 2 else 10)
+    elif cmd:
+        sys.exit(__doc__)
+    else:
+        while True:
+            try:
+                tick()
+            except Exception as e:  # keep the daemon alive on a bad config edit
+                print(f"wallrotate: {e}", file=sys.stderr)
+            time.sleep(60)
